@@ -1,406 +1,286 @@
-#include <nuttx/config.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <time.h>
-#include <errno.h>
-#include <math.h>
-#include <sys/ioctl.h>
-#include <nuttx/timers/pwm.h>
-#include <nuttx/i2c/i2c_master.h> 
-
+#include "pasil_ekf.h"
 #define ARM_MATH_CM4
 #include <arm_math.h>
+#include <math.h>
 
-/* STMicroelectronics VL53L0X API */
-#include "vl53l0x_api.h"
+/* --- ESKF Tuning Parameters --- */
+#define Q_ANGLE_VAR 0.0001f    /* Gyro noise variance */
+#define Q_BIAS_VAR  0.000001f  /* Gyro bias random walk variance */
+#define R_ACCEL_VAR 0.01f      /* Accelerometer measurement noise */
+#define R_MAG_VAR   0.05f      /* Magnetometer measurement noise */
 
-#define LOOP_PERIOD_NS 2000000 /* 500Hz */
-#define SEC_TO_NS      1000000000
-#define DT_SEC         0.002f
+/* --- State Variables --- */
+static eskf_state_t nominal_state;
 
-#define KP 15.0f
-#define KI 0.0f
-#define KD 0.5f
+/* --- CMSIS-DSP Matrix Memory (6x6 Error State) --- */
+static float32_t P_data[36];
+static float32_t F_data[36], F_T_data[36], Q_data[36];
+static float32_t temp6x6_A[36], temp6x6_B[36];
 
-/* INJECT YAW GAINS */
-#define KP_YAW 10.0f /* Yaw relies on counter-torque, needs unique tuning */
-#define KI_YAW 0.0f
-#define KD_YAW 0.0f
-
-#define PWM_NEUTRAL 4915
-#define PWM_MIN     3276
-#define PWM_MAX     6553
-#define STATE_DIM 7
-
-#define QMC5883P_ADDR 0x2C
-#define BMP280_ADDR   0x76
-
-#define CLAMP_PWM(val) ((uint16_t)((val) > PWM_MAX ? PWM_MAX : ((val) < PWM_MIN ? PWM_MIN : (val))))  //Physical safety net
-
-/* Standard 32-Byte NRF24 Payload Limit */
-typedef struct __attribute__((packed)) {
-    uint8_t  magic;       
-    uint8_t  state;       
-    int16_t  throttle;    
-    int16_t  pitch;       
-    int16_t  roll;        
-    int16_t  yaw;         
-    uint16_t checksum;    
-} rc_payload_t;
+static arm_matrix_instance_f32 P     = {6, 6, P_data};
+static arm_matrix_instance_f32 F     = {6, 6, F_data};
+static arm_matrix_instance_f32 F_T   = {6, 6, F_T_data};
+static arm_matrix_instance_f32 Q     = {6, 6, Q_data};
+static arm_matrix_instance_f32 T_6x6A= {6, 6, temp6x6_A};
+static arm_matrix_instance_f32 T_6x6B= {6, 6, temp6x6_B};
 
 
-/* Global File Descriptor for ST API Wrapper */
-int pasil_fd_i2c = -1;
+/* --- Helper: Fast 3x3 Matrix Inverse (Bypasses CMSIS-DSP Linker issues) --- */
+static int invert_3x3_f32(float32_t* m, float32_t* invOut) {
+    float det = m[0] * (m[4] * m[8] - m[5] * m[7]) -
+                m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                m[2] * (m[3] * m[7] - m[4] * m[6]);
 
-/* BMP280 Calibration State */
-static uint16_t dig_T1, dig_P1;
-static int16_t  dig_T2, dig_T3, dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
-static int32_t  t_fine;
+    if (fabsf(det) < 1e-6f) return -1; /* Singular matrix */
 
-static float32_t P_data[49], F_data[49], F_T_data[49], Q_data[49], temp_data[49], new_P_data[49];
-static arm_matrix_instance_f32 P, F, F_T, Q, TempMat, NewP;
+    float invdet = 1.0f / det;
 
-static void init_ekf_matrices(void) {
-    arm_mat_init_f32(&P, STATE_DIM, STATE_DIM, P_data); arm_mat_init_f32(&F, STATE_DIM, STATE_DIM, F_data);
-    arm_mat_init_f32(&F_T, STATE_DIM, STATE_DIM, F_T_data); arm_mat_init_f32(&Q, STATE_DIM, STATE_DIM, Q_data);
-    arm_mat_init_f32(&TempMat, STATE_DIM, STATE_DIM, temp_data); arm_mat_init_f32(&NewP, STATE_DIM, STATE_DIM, new_P_data);
-    for (int i = 0; i < 49; i++) { P_data[i] = 0.0f; F_data[i] = 0.0f; Q_data[i] = 0.0f; }
-    for (int i = 0; i < 7; i++) { P_data[i * 8] = 1.0f; F_data[i * 8] = 1.0f; Q_data[i * 8] = 0.001f; }
+    invOut[0] = (m[4] * m[8] - m[5] * m[7]) * invdet;
+    invOut[1] = (m[2] * m[7] - m[1] * m[8]) * invdet;
+    invOut[2] = (m[1] * m[5] - m[2] * m[4]) * invdet;
+    invOut[3] = (m[5] * m[6] - m[3] * m[8]) * invdet;
+    invOut[4] = (m[0] * m[8] - m[2] * m[6]) * invdet;
+    invOut[5] = (m[2] * m[3] - m[0] * m[5]) * invdet;
+    invOut[6] = (m[3] * m[7] - m[4] * m[6]) * invdet;
+    invOut[7] = (m[1] * m[6] - m[0] * m[7]) * invdet;
+    invOut[8] = (m[0] * m[4] - m[1] * m[3]) * invdet;
+
+    return 0; /* Success */
 }
 
-static void timespec_add_ns(struct timespec *ts, long ns) {
-    ts->tv_nsec += ns;
-    if (ts->tv_nsec >= SEC_TO_NS) { ts->tv_sec++; ts->tv_nsec -= SEC_TO_NS; }
-}
 
-static void i2c_write_reg(int fd, uint8_t addr, uint8_t reg, uint8_t value) {
-    struct i2c_msg_s msg; struct i2c_transfer_s xfer;
-    uint8_t tx_data[2] = {reg, value};
-    msg.frequency = 400000; msg.addr = addr; msg.flags = 0;    
-    msg.buffer = tx_data; msg.length = 2; xfer.msgv = &msg; xfer.msgc = 1;
-    ioctl(fd, I2CIOC_TRANSFER, (unsigned long)&xfer);
-}
-
-static void bmp280_extract_cal(int fd) {
-    struct i2c_msg_s msg[2]; struct i2c_transfer_s xfer;
-    uint8_t reg = 0x88; uint8_t cal[24];
-    msg[0].frequency = 400000; msg[0].addr = BMP280_ADDR; msg[0].flags = 0; msg[0].buffer = &reg; msg[0].length = 1;
-    msg[1].frequency = 400000; msg[1].addr = BMP280_ADDR; msg[1].flags = I2C_M_READ; msg[1].buffer = cal; msg[1].length = 24;
-    xfer.msgv = msg; xfer.msgc = 2;
-    if(ioctl(fd, I2CIOC_TRANSFER, (unsigned long)&xfer) >= 0) {
-        dig_T1 = (cal[1] << 8) | cal[0];  dig_T2 = (cal[3] << 8) | cal[2];  dig_T3 = (cal[5] << 8) | cal[4];
-        dig_P1 = (cal[7] << 8) | cal[6];  dig_P2 = (cal[9] << 8) | cal[8];  dig_P3 = (cal[11] << 8) | cal[10];
-        dig_P4 = (cal[13] << 8) | cal[12]; dig_P5 = (cal[15] << 8) | cal[14]; dig_P6 = (cal[17] << 8) | cal[16];
-        dig_P7 = (cal[19] << 8) | cal[18]; dig_P8 = (cal[21] << 8) | cal[20]; dig_P9 = (cal[23] << 8) | cal[22];
+/* --- Helper: Normalize Quaternion --- */
+static void normalize_quaternion(void) {
+    float norm = sqrtf(nominal_state.q0 * nominal_state.q0 + 
+                       nominal_state.q1 * nominal_state.q1 + 
+                       nominal_state.q2 * nominal_state.q2 + 
+                       nominal_state.q3 * nominal_state.q3);
+    if (norm > 0.0f) {
+        nominal_state.q0 /= norm;
+        nominal_state.q1 /= norm;
+        nominal_state.q2 /= norm;
+        nominal_state.q3 /= norm;
+    } else {
+        nominal_state.q0 = 1.0f; nominal_state.q1 = 0.0f; 
+        nominal_state.q2 = 0.0f; nominal_state.q3 = 0.0f;
     }
 }
 
-static float bmp280_calculate_pressure(int32_t adc_T, int32_t adc_P) {
-    int32_t var1, var2; int64_t p_var1, p_var2, p;
-    var1 = ((((adc_T >> 3) - ((int32_t)dig_T1 << 1))) * ((int32_t)dig_T2)) >> 11;
-    var2 = (((((adc_T >> 4) - ((int32_t)dig_T1)) * ((adc_T >> 4) - ((int32_t)dig_T1))) >> 12) * ((int32_t)dig_T3)) >> 14;
-    t_fine = var1 + var2;
-    p_var1 = ((int64_t)t_fine) - 128000;
-    p_var2 = p_var1 * p_var1 * (int64_t)dig_P6;
-    p_var2 = p_var2 + ((p_var1 * (int64_t)dig_P5) << 17);
-    p_var2 = p_var2 + (((int64_t)dig_P4) << 35);
-    p_var1 = ((p_var1 * p_var1 * (int64_t)dig_P3) >> 8) + ((p_var1 * (int64_t)dig_P2) << 12);
-    p_var1 = (((((int64_t)1) << 47) + p_var1)) * ((int64_t)dig_P1) >> 33;
-    if (p_var1 == 0) return 0; 
-    p = 1048576 - adc_P;
-    p = (((p << 31) - p_var2) * 3125) / p_var1;
-    p_var1 = (((int64_t)dig_P9) * (p >> 13) * (p >> 13)) >> 25;
-    p_var2 = (((int64_t)dig_P8) * p) >> 19;
-    p = ((p + p_var1 + p_var2) >> 8) + (((int64_t)dig_P7) << 4);
-    return (float)p / 256.0f;
+/* --- Helper: Inject Error State into Nominal State --- */
+static void inject_error(float32_t* err_state) {
+    /* err_state = [dTheta_x, dTheta_y, dTheta_z, db_x, db_y, db_z] */
+    float dq0 = 1.0f;
+    float dq1 = 0.5f * err_state[0];
+    float dq2 = 0.5f * err_state[1];
+    float dq3 = 0.5f * err_state[2];
+
+    /* Quaternion Multiplication: q_new = q_old * dq */
+    float q0_new = nominal_state.q0*dq0 - nominal_state.q1*dq1 - nominal_state.q2*dq2 - nominal_state.q3*dq3;
+    float q1_new = nominal_state.q0*dq1 + nominal_state.q1*dq0 + nominal_state.q2*dq3 - nominal_state.q3*dq2;
+    float q2_new = nominal_state.q0*dq2 - nominal_state.q1*dq3 + nominal_state.q2*dq0 + nominal_state.q3*dq1;
+    float q3_new = nominal_state.q0*dq3 + nominal_state.q1*dq2 - nominal_state.q2*dq1 + nominal_state.q3*dq0;
+
+    nominal_state.q0 = q0_new;
+    nominal_state.q1 = q1_new;
+    nominal_state.q2 = q2_new;
+    nominal_state.q3 = q3_new;
+    normalize_quaternion();
+
+    /* Inject Bias Error */
+    nominal_state.bg_x += err_state[3];
+    nominal_state.bg_y += err_state[4];
+    nominal_state.bg_z += err_state[5];
 }
 
-int pasil_imu_task(int argc, char *argv[]) {
-    struct timespec wakeup_time;
-    int fd_imu, fd_pwm0, fd_pwm1;
-    struct pwm_info_s pwm0_info;
-    struct pwm_info_s pwm1_info;
+/* =====================================================================
+ * PUBLIC API IMPLEMENTATION
+ * ===================================================================== */
 
-    uint32_t cycle_count = 0;
+void eskf_init(void) {
+    /* Init Nominal State */
+    nominal_state.q0 = 1.0f; nominal_state.q1 = 0.0f; 
+    nominal_state.q2 = 0.0f; nominal_state.q3 = 0.0f;
+    nominal_state.bg_x = 0.0f; nominal_state.bg_y = 0.0f; nominal_state.bg_z = 0.0f;
+
+    /* Init Matrices */
+    for (int i = 0; i < 36; i++) { P_data[i] = 0.0f; Q_data[i] = 0.0f; }
     
-    float pitch = 0.0f, pitch_accel = 0.0f;
-    float roll = 0.0f,  roll_accel = 0.0f;
-    float gx = 0.0f, gy = 0.0f, gz = 0.0f; /* Gyro rates (deg/sec) */
+    /* P: Initial Covariance (Uncertainty) */
+    for (int i = 0; i < 3; i++) P_data[i * 7] = 0.1f;       /* Angle uncertainty */
+    for (int i = 3; i < 6; i++) P_data[i * 7] = 0.001f;     /* Bias uncertainty */
 
-    /* Pitch PID States */
-    float err_p = 0.0f, int_p = 0.0f, der_p = 0.0f, last_p = 0.0f;
-    /* Roll PID States */
-    float err_r = 0.0f, int_r = 0.0f, der_r = 0.0f, last_r = 0.0f;
-    /* Yaw PID States */
-    float err_y = 0.0f, int_y = 0.0f, der_y = 0.0f, last_y = 0.0f;
+    /* Q: Process Noise */
+    for (int i = 0; i < 3; i++) Q_data[i * 7] = Q_ANGLE_VAR; 
+    for (int i = 3; i < 6; i++) Q_data[i * 7] = Q_BIAS_VAR;  
+}
 
+void eskf_predict(float gyro_x, float gyro_y, float gyro_z, float dt) {
+    /* 1. Correct raw gyro with estimated bias */
+    float wx = gyro_x - nominal_state.bg_x;
+    float wy = gyro_y - nominal_state.bg_y;
+    float wz = gyro_z - nominal_state.bg_z;
 
-    int16_t mag_x = 0, mag_y = 0, mag_z = 0;
-    uint16_t laser_dist_mm = 0;
-    float true_pressure_pa = 0.0f;
+    /* 2. Nominal State Kinematic Integration (Zeroth-order hold) */
+    float dq0 = 1.0f;
+    float dq1 = 0.5f * wx * dt;
+    float dq2 = 0.5f * wy * dt;
+    float dq3 = 0.5f * wz * dt;
 
-    VL53L0X_Dev_t tof_dev_struct;
-    VL53L0X_DEV tof_dev = &tof_dev_struct;
-    tof_dev->I2cDevAddr = 0x29; /* 7-bit standard address */
-
-    printf("[PASIL-MASTER] Finalizing Fleet Assault...\n");
-    init_ekf_matrices();
-
-    fd_imu = open("/dev/imu0", O_RDONLY);
-    fd_pwm0 = open("/dev/pwm0", O_RDWR);
-    fd_pwm1 = open("/dev/pwm1", O_RDWR);
-    if (fd_pwm0 < 0 || fd_pwm1 < 0) {
-        printf("[FATAL] Kinetic Network Offline.\n");
-        return -ENODEV;
-    }
-
-    int fd_rf = open("/dev/nrf24l01", O_RDONLY | O_NONBLOCK);
-    if (fd_rf < 0) {
-        printf("[WARN] RF Link Offline. Booting to Failsafe.\n");
-    }
-
-    pasil_fd_i2c = open("/dev/i2c1", O_RDWR);
-
-    /* Configure TIM2 (Motors 1, 2, 3) */
-    pwm0_info.frequency = 50; /* 50Hz Standard ESC/Motor Driver rate */
-    pwm0_info.channels[0].channel = 2; pwm0_info.channels[0].duty = PWM_NEUTRAL; /* PA1 */
-    pwm0_info.channels[1].channel = 3; pwm0_info.channels[1].duty = PWM_NEUTRAL; /* PA2 */
-    pwm0_info.channels[2].channel = 4; pwm0_info.channels[2].duty = PWM_NEUTRAL; /* PA3 */
+    float q0_new = nominal_state.q0*dq0 - nominal_state.q1*dq1 - nominal_state.q2*dq2 - nominal_state.q3*dq3;
+    float q1_new = nominal_state.q0*dq1 + nominal_state.q1*dq0 + nominal_state.q2*dq3 - nominal_state.q3*dq2;
+    float q2_new = nominal_state.q0*dq2 - nominal_state.q1*dq3 + nominal_state.q2*dq0 + nominal_state.q3*dq1;
+    float q3_new = nominal_state.q0*dq3 + nominal_state.q1*dq2 - nominal_state.q2*dq1 + nominal_state.q3*dq0;
     
-    /* Configure TIM3 (Motor 4) */
-    pwm1_info.frequency = 50; 
-    pwm1_info.channels[0].channel = 1; pwm1_info.channels[0].duty = PWM_NEUTRAL; /* PA4 */
+    nominal_state.q0 = q0_new; nominal_state.q1 = q1_new; 
+    nominal_state.q2 = q2_new; nominal_state.q3 = q3_new;
+    normalize_quaternion();
 
-    /* Execute the Arming Handshake */
-    ioctl(fd_pwm0, PWMIOC_SETCHARACTERISTICS, (unsigned long)((uintptr_t)&pwm0_info));
-    ioctl(fd_pwm0, PWMIOC_START, 0);
+    /* 3. Error State Covariance Predict: P = F * P * F^T + Q */
+    for (int i = 0; i < 36; i++) F_data[i] = 0.0f;
+    
+    /* F_11 = I - [wx]dt (Skew Symmetric) */
+    F_data[0] = 1.0f; F_data[1] = wz*dt;  F_data[2] = -wy*dt;
+    F_data[6] = -wz*dt; F_data[7] = 1.0f; F_data[8] = wx*dt;
+    F_data[12]= wy*dt;  F_data[13]= -wx*dt; F_data[14]= 1.0f;
 
-    ioctl(fd_pwm1, PWMIOC_SETCHARACTERISTICS, (unsigned long)((uintptr_t)&pwm1_info));
-    ioctl(fd_pwm1, PWMIOC_START, 0);
+    /* F_12 = -I * dt (Mapping bias error to angle error) */
+    F_data[3] = -dt; F_data[10]= -dt; F_data[17]= -dt;
 
+    /* F_22 = I (Bias is modeled as random walk) */
+    F_data[21]= 1.0f; F_data[28]= 1.0f; F_data[35]= 1.0f;
 
-    if (pasil_fd_i2c >= 0) {
-        printf("[PASIL-MASTER] Waking Barometer & Magnetometer...\n");
-        bmp280_extract_cal(pasil_fd_i2c);
-        //i2c_write_reg(pasil_fd_i2c, BMP280_ADDR, 0xE0, 0xB6);
-        i2c_write_reg(pasil_fd_i2c, BMP280_ADDR, 0xF4, 0x55);
-        i2c_write_reg(pasil_fd_i2c, QMC5883P_ADDR, 0x0B, 0x01); usleep(50000); 
-        i2c_write_reg(pasil_fd_i2c, QMC5883P_ADDR, 0x20, 0x40);
-        i2c_write_reg(pasil_fd_i2c, QMC5883P_ADDR, 0x21, 0x01);
-        i2c_write_reg(pasil_fd_i2c, QMC5883P_ADDR, 0x0A, 0x1D); usleep(50000);
+    /* Math: P = F * P * F^T + Q */
+    arm_mat_trans_f32(&F, &F_T);
+    arm_mat_mult_f32(&F, &P, &T_6x6A);      /* T_6x6A = F * P */
+    arm_mat_mult_f32(&T_6x6A, &F_T, &T_6x6B);/* T_6x6B = F * P * F^T */
+    arm_mat_add_f32(&T_6x6B, &Q, &P);       /* P = T_6x6B + Q */
+}
 
-        printf("[PASIL-MASTER] Uploading ST Firmware to Laser...\n");
-        VL53L0X_DataInit(tof_dev);
-        VL53L0X_StaticInit(tof_dev);
-        uint32_t refSpadCount; uint8_t isApertureSpads;
-        VL53L0X_PerformRefSpadManagement(tof_dev, &refSpadCount, &isApertureSpads);
-        VL53L0X_PerformRefCalibration(tof_dev, NULL, NULL);
-        VL53L0X_SetDeviceMode(tof_dev, VL53L0X_DEVICEMODE_CONTINUOUS_RANGING);
-        VL53L0X_StartMeasurement(tof_dev);
-    }
+void eskf_update_accel(float ax, float ay, float az) {
+    /* 1. Normalize Measurement */
+    float norm = sqrtf(ax*ax + ay*ay + az*az);
+    if(norm < 0.1f) return; /* Freefall rejection */
+    ax /= norm; ay /= norm; az /= norm;
 
+    /* 2. Predicted Gravity from current Quaternion */
+    float gx = 2.0f * (nominal_state.q1 * nominal_state.q3 - nominal_state.q0 * nominal_state.q2);
+    float gy = 2.0f * (nominal_state.q2 * nominal_state.q3 + nominal_state.q0 * nominal_state.q1);
+    float gz = nominal_state.q0*nominal_state.q0 - nominal_state.q1*nominal_state.q1 - nominal_state.q2*nominal_state.q2 + nominal_state.q3*nominal_state.q3;
 
-    clock_gettime(CLOCK_MONOTONIC, &wakeup_time);
+    /* 3. Innovation (Measurement Residual) */
+    float32_t y_data[3] = {ax - gx, ay - gy, az - gz};
+    arm_matrix_instance_f32 Y = {3, 1, y_data};
 
-    for(int i = 0; i < 2500; i++) {
-        cycle_count++;
-        timespec_add_ns(&wakeup_time, LOOP_PERIOD_NS);
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wakeup_time, NULL);
+    /* 4. Jacobian H (3x6) for gravity */
+    float32_t H_data[18] = {0};
+    H_data[0] = 0.0f; H_data[1] = -gz;  H_data[2] = gy;
+    H_data[6] = gz;   H_data[7] = 0.0f; H_data[8] = -gx;
+    H_data[12]= -gy;  H_data[13]= gx;   H_data[14]= 0.0f;
+    
+    arm_matrix_instance_f32 H = {3, 6, H_data};
+    
+    /* 5. Kalman Gain K = P * H^T * (H * P * H^T + R)^-1 */
+    float32_t HT_data[18], PHT_data[18], S_data[9], Sinv_data[9], K_data[18];
+    arm_matrix_instance_f32 H_T = {6, 3, HT_data};
+    arm_matrix_instance_f32 PHT = {6, 3, PHT_data};
+    arm_matrix_instance_f32 S   = {3, 3, S_data};
+    arm_matrix_instance_f32 Sinv= {3, 3, Sinv_data};
+    arm_matrix_instance_f32 K   = {6, 3, K_data};
 
-        /* 500Hz: IMU */
-        int16_t raw_mem[16] = {0}; 
-        if (read(fd_imu, raw_mem, sizeof(raw_mem)) >= 12) {
-            gx = (float)raw_mem[0]; 
-            gy = (float)raw_mem[1]; 
-            gz = (float)raw_mem[2]; 
-            float ax = (float)raw_mem[3]; 
-            float ay = (float)raw_mem[4]; 
-            float az = (float)raw_mem[5];
-            
-            /* Pitch Complementary Filter */
-            pitch_accel = atan2f(-ax, sqrtf(ay*ay + az*az)) * 180.0f / M_PI;
-            pitch = 0.98f * (pitch + gy * DT_SEC) + (0.02f) * pitch_accel;
+    arm_mat_trans_f32(&H, &H_T);
+    arm_mat_mult_f32(&P, &H_T, &PHT);
+    arm_mat_mult_f32(&H, &PHT, &S);
 
-            /* Roll Complementary Filter */
-            roll_accel = atan2f(ay, az) * 180.0f / M_PI;
-            roll = 0.98f * (roll + gx * DT_SEC) + (0.02f) * roll_accel;
-            
-            /* (Yaw angle is tracked by the Magnetometer EKF later; 
-             * the flight loop only needs the 'gz' gyro rate for stability) */
-        }
+    /* Add R (Measurement Noise) */
+    S_data[0] += R_ACCEL_VAR; S_data[4] += R_ACCEL_VAR; S_data[8] += R_ACCEL_VAR;
+    
+    /* Redundant
+    if (arm_mat_inverse_f32(&S, &Sinv) != ARM_MATH_SUCCESS) return;
+    arm_mat_mult_f32(&PHT, &Sinv, &K);
+    */
 
-        arm_mat_trans_f32(&F, &F_T); arm_mat_mult_f32(&F, &P, &TempMat);
-        arm_mat_mult_f32(&TempMat, &F_T, &NewP); arm_mat_add_f32(&NewP, &Q, &P);
+    if (invert_3x3_f32(S_data, Sinv_data) != 0) return; /* Matrix singular check */
+    arm_mat_mult_f32(&PHT, &Sinv, &K);
 
-        /* 50Hz: MAGNETOMETER */
-        if (pasil_fd_i2c >= 0 && (cycle_count % 10 == 5)) {
-            struct i2c_msg_s msg[2]; struct i2c_transfer_s xfer; uint8_t mag_status = 0;
-            uint8_t reg_status = 0x09;
-            msg[0].frequency = 400000; msg[0].addr = QMC5883P_ADDR; msg[0].flags = 0; msg[0].buffer = &reg_status; msg[0].length = 1;
-            msg[1].frequency = 400000; msg[1].addr = QMC5883P_ADDR; msg[1].flags = I2C_M_READ; msg[1].buffer = &mag_status; msg[1].length = 1;
-            xfer.msgv = msg; xfer.msgc = 2;
-            
-            if (ioctl(pasil_fd_i2c, I2CIOC_TRANSFER, (unsigned long)&xfer) >= 0 && (mag_status & 0x01)) {
-                uint8_t reg_data = 0x01; uint8_t rx_data[6] = {0};
-                msg[0].buffer = &reg_data; msg[1].buffer = rx_data; msg[1].length = 6;
-                if (ioctl(pasil_fd_i2c, I2CIOC_TRANSFER, (unsigned long)&xfer) >= 0) {
-                    mag_x = (int16_t)(rx_data[0] | (rx_data[1] << 8));
-                    mag_y = (int16_t)(rx_data[2] | (rx_data[3] << 8));
-                    mag_z = (int16_t)(rx_data[4] | (rx_data[5] << 8));
-                }
-            }
-        }
+    /* 6. Compute Error State: dx = K * y */
+    float32_t dx_data[6];
+    arm_matrix_instance_f32 dX = {6, 1, dx_data};
+    arm_mat_mult_f32(&K, &Y, &dX);
 
-        /* 10Hz: BAROMETER */
-        if (pasil_fd_i2c >= 0 && (cycle_count % 50 == 8)) {
-            struct i2c_msg_s msg[2]; struct i2c_transfer_s xfer;
-            uint8_t reg_press = 0xF7, reg_status = 0xF3; uint8_t rx_data[6] = {0}, status = 0;
+    /* 7. Inject Error and Update Covariance: P = (I - K*H) * P */
+    inject_error(dx_data);
+    
+    float32_t KH_data[36]; arm_matrix_instance_f32 KH = {6, 6, KH_data};
+    arm_mat_mult_f32(&K, &H, &KH);
+    for(int i=0; i<36; i++) { T_6x6A.pData[i] = -KH_data[i]; }
+    T_6x6A.pData[0]+=1.0f; T_6x6A.pData[7]+=1.0f; T_6x6A.pData[14]+=1.0f; 
+    T_6x6A.pData[21]+=1.0f; T_6x6A.pData[28]+=1.0f; T_6x6A.pData[35]+=1.0f;
+    arm_mat_mult_f32(&T_6x6A, &P, &T_6x6B);
+    for(int i=0; i<36; i++) { P.pData[i] = T_6x6B.pData[i]; }
+}
 
-            i2c_write_reg(pasil_fd_i2c, BMP280_ADDR, 0xF4, 0x55);
+void eskf_update_mag(float mx, float my, float mz) {
+    /* 1D Yaw Update for Computational Efficiency */
+    euler_angles_t current = eskf_get_euler();
+    
+    /* Tilt Compensation */
+    float cos_r = cosf(current.roll_rad);  float sin_r = sinf(current.roll_rad);
+    float cos_p = cosf(current.pitch_rad); float sin_p = sinf(current.pitch_rad);
+    
+    float Xh = mx * cos_p + mz * sin_p;
+    float Yh = mx * sin_r * sin_p + my * cos_r - mz * sin_r * cos_p;
+    
+    float measured_yaw = atan2f(Yh, Xh);
+    
+    /* Innovation */
+    float y = measured_yaw - current.yaw_rad;
+    while(y > M_PI) y -= 2.0f * M_PI;
+    while(y < -M_PI) y += 2.0f * M_PI;
 
-            /* BUSY WAIT: Poll Status Register 0xF3 Bit 3 (im_update) and Bit 0 (measuring) */
-            /* We only try 5 times to avoid hanging the 500Hz loop */
-            for(int retry = 0; retry < 5; retry++) {
-                msg[0].frequency = 400000; msg[0].addr = BMP280_ADDR; msg[0].flags = 0;
-                msg[0].buffer = &reg_status; msg[0].length = 1;
-                msg[1].frequency = 400000; msg[1].addr = BMP280_ADDR; msg[1].flags = I2C_M_READ;
-                msg[1].buffer = &status; msg[1].length = 1;
-                xfer.msgv = msg; xfer.msgc = 2;
-                ioctl(pasil_fd_i2c, I2CIOC_TRANSFER, (unsigned long)&xfer);
-                
-                if (!(status & 0x09)) break; // Exit if not busy
-            }
-
-            msg[0].frequency = 400000; msg[0].addr = BMP280_ADDR; msg[0].flags = 0; msg[0].buffer = &reg_press; msg[0].length = 1;
-            msg[1].frequency = 400000; msg[1].addr = BMP280_ADDR; msg[1].flags = I2C_M_READ; msg[1].buffer = rx_data; msg[1].length = 6;
-            xfer.msgv = msg; xfer.msgc = 2;
-            
-            if (ioctl(pasil_fd_i2c, I2CIOC_TRANSFER, (unsigned long)&xfer) >= 0) {
-                int32_t adc_P = (rx_data[0] << 12) | (rx_data[1] << 4) | (rx_data[2] >> 4);
-                int32_t adc_T = (rx_data[3] << 12) | (rx_data[4] << 4) | (rx_data[5] >> 4);
-                true_pressure_pa = bmp280_calculate_pressure(adc_T, adc_P);
-            }
-        }
-
-        /* 10Hz: LASER TELEMETRY (TDM Offset 2 to avoid collisions) */
-        if (pasil_fd_i2c >= 0 && (cycle_count % 50 == 2)) {
-            uint8_t dataReady = 0;
-            VL53L0X_GetMeasurementDataReady(tof_dev, &dataReady);
-            if(dataReady == 1) {
-                VL53L0X_RangingMeasurementData_t r_data;
-                VL53L0X_GetRangingMeasurementData(tof_dev, &r_data);
-                laser_dist_mm = r_data.RangeMilliMeter;
-                VL53L0X_ClearInterruptMask(tof_dev, 0); /* Clears the interrupt to fetch next reading */
-            }
-        }
-
-        /* --- RF TELEMETRY INGESTION --- */
-        static rc_payload_t rx_data;
-        static uint32_t last_packet_time = 0;
-        
-        if (fd_rf >= 0) {
-            /* Attempt to read a packet (Non-Blocking) */
-            if (read(fd_rf, &rx_data, sizeof(rc_payload_t)) == sizeof(rc_payload_t)) {
-                /* Verify Packet Integrity */
-                if (rx_data.magic == 0x5A) {
-                    last_packet_time = cycle_count;
-                }
-            }
-        }
-
-        /* --- FAILSAFE & TARGET MAPPING --- */
-        // ... your existing code continues here ...
-        // int32_t throttle_base = PWM_MIN;
-
-        /* ---------------------------------------------------------
-         * FLIGHT CONTROL MIXER & KINEMATICS
-         * --------------------------------------------------------- */
-        
-        /* 1. Calculate individual axis PID outputs 
-         --- FAILSAFE & TARGET MAPPING --- */
-        int32_t throttle_base = PWM_MIN;
-        float target_pitch = 0.0f;
-        float target_roll  = 0.0f;
-        float target_yaw   = 0.0f;
-
-        if (fd_rf >= 0 && (cycle_count - last_packet_time) < 50 && rx_data.state == 1) {
-            throttle_base = PWM_MIN + ((rx_data.throttle * (PWM_MAX - PWM_MIN)) / 1000);
-            target_pitch = (float)rx_data.pitch * (30.0f / 1000.0f); /* +/- 30 degrees max */
-            target_roll  = (float)rx_data.roll  * (30.0f / 1000.0f); /* +/- 30 degrees max */
-            target_yaw   = (float)rx_data.yaw   * (45.0f / 1000.0f); /* +/- 45 deg/sec max rotation */
-        }
-
-        /* ---------------------------------------------------------
-         * 3-AXIS PID KINETIC CONTROLLER
-         * --------------------------------------------------------- */
-         
-        /* PITCH LOOP (Attitude) */
-        err_p = target_pitch - pitch; 
-        int_p += err_p * DT_SEC; 
-        der_p = (err_p - last_p) / DT_SEC;
-        int32_t pitch_pid_out = (int32_t)((KP * err_p) + (KI * int_p) + (KD * der_p));
-        last_p = err_p;
-
-        /* ROLL LOOP (Attitude) */
-        err_r = target_roll - roll; 
-        int_r += err_r * DT_SEC; 
-        der_r = (err_r - last_r) / DT_SEC;
-        int32_t roll_pid_out  = (int32_t)((KP * err_r) + (KI * int_r) + (KD * der_r));
-        last_r = err_r;
-
-        /* YAW LOOP (Rate)
-         * Notice we subtract 'gz' (current rotational speed), not an absolute angle.
-         * The stick commands how FAST the drone spins, not where it points. */
-        err_y = target_yaw - gz; 
-        int_y += err_y * DT_SEC; 
-        der_y = (err_y - last_y) / DT_SEC;
-        int32_t yaw_pid_out   = (int32_t)((KP_YAW * err_y) + (KI_YAW * int_y) + (KD_YAW * der_y));
-        last_y = err_y;
-
-        /* ---------------------------------------------------------
-         * KINEMATIC MIXER
-         * --------------------------------------------------------- */
-        int32_t m1_target = throttle_base - pitch_pid_out - roll_pid_out - yaw_pid_out;
-        int32_t m2_target = throttle_base + pitch_pid_out + roll_pid_out - yaw_pid_out;
-        int32_t m3_target = throttle_base - pitch_pid_out + roll_pid_out + yaw_pid_out;
-        int32_t m4_target = throttle_base + pitch_pid_out - roll_pid_out + yaw_pid_out;
-
-        pwm0_info.channels[0].duty = CLAMP_PWM(m1_target); 
-        pwm0_info.channels[1].duty = CLAMP_PWM(m2_target); 
-        pwm0_info.channels[2].duty = CLAMP_PWM(m3_target); 
-        pwm1_info.channels[0].duty = CLAMP_PWM(m4_target); 
-
-        ioctl(fd_pwm0, PWMIOC_SETCHARACTERISTICS, (unsigned long)((uintptr_t)&pwm0_info));
-        ioctl(fd_pwm1, PWMIOC_SETCHARACTERISTICS, (unsigned long)((uintptr_t)&pwm1_info));
-
-        /* --- TACTICAL TELEMETRY (2Hz) --- */
-        if (cycle_count % 250 == 0) {
-            printf("ATT:[%4d] | MAG:[%5d %5d %5d] | BARO:[%8.1f Pa] | LASER:[%4d mm] | M1/M2/M3/M4:[%5d %5d %5d %5d]\n", 
-                   (int)pitch, mag_x, mag_y, mag_z, true_pressure_pa, laser_dist_mm,
-                   (int)pwm0_info.channels[0].duty, (int)pwm0_info.channels[1].duty, 
-                   (int)pwm0_info.channels[2].duty, (int)pwm1_info.channels[0].duty);
+    /* Jacobian for 1D Yaw */
+    //float32_t H_data[6] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+    //arm_matrix_instance_f32 H = {1, 6, H_data};
+    
+    /* K = P * H^T / (H * P * H^T + R) */
+    float S = P_data[14] + R_MAG_VAR; /* P_data[14] is P(2,2), the Z-axis angle variance */
+    
+    float32_t dx_data[6];
+    for(int i=0; i<6; i++) {
+        float K_i = P_data[i*6 + 2] / S; 
+        dx_data[i] = K_i * y;
+        /* Update P */
+        for(int j=0; j<6; j++) {
+            T_6x6B.pData[i*6 + j] = P_data[i*6 + j] - K_i * P_data[2*6 + j];
         }
     }
+    
+    for(int i=0; i<36; i++) P_data[i] = T_6x6B.pData[i];
+    inject_error(dx_data);
+}
 
-    /* System Disarm */
-    pwm0_info.channels[0].duty = PWM_MIN;
-    pwm0_info.channels[1].duty = PWM_MIN;
-    pwm0_info.channels[2].duty = PWM_MIN;
-    ioctl(fd_pwm0, PWMIOC_SETCHARACTERISTICS, (unsigned long)((uintptr_t)&pwm0_info));
-    ioctl(fd_pwm0, PWMIOC_STOP, 0);
+eskf_state_t eskf_get_state(void) {
+    return nominal_state;
+}
 
-    pwm1_info.channels[0].duty = PWM_MIN;
-    ioctl(fd_pwm1, PWMIOC_SETCHARACTERISTICS, (unsigned long)((uintptr_t)&pwm1_info));
-    ioctl(fd_pwm1, PWMIOC_STOP, 0);
+euler_angles_t eskf_get_euler(void) {
+    euler_angles_t euler;
     
-    if (fd_pwm0 >= 0) close(fd_pwm0);
-    if (fd_pwm1 >= 0) close(fd_pwm1);
+    /* Quaternion to Euler Angle Conversion */
+    //float sqw = nominal_state.q0 * nominal_state.q0;
+    float sqx = nominal_state.q1 * nominal_state.q1;
+    float sqy = nominal_state.q2 * nominal_state.q2;
+    float sqz = nominal_state.q3 * nominal_state.q3;
+
+    /* Roll */
+    euler.roll_rad = atan2f(2.0f * (nominal_state.q0 * nominal_state.q1 + nominal_state.q2 * nominal_state.q3), 1.0f - 2.0f * (sqx + sqy));
     
-    /* Cleaned up shutdown logic to satisfy GNU GCC strict indentation rules */
-    if (pasil_fd_i2c >= 0) { close(pasil_fd_i2c); }
+    /* Pitch (Protected against Gimbal Lock NaN) */
+    float sinp = 2.0f * (nominal_state.q0 * nominal_state.q2 - nominal_state.q3 * nominal_state.q1);
+    if (fabsf(sinp) >= 1.0f) euler.pitch_rad = copysignf(M_PI / 2.0f, sinp); 
+    else euler.pitch_rad = asinf(sinp);
     
-    printf("[PASIL-MASTER] Stack Disarmed. Fleet Assault Complete.\n");
-    return OK;
+    /* Yaw */
+    euler.yaw_rad = atan2f(2.0f * (nominal_state.q0 * nominal_state.q3 + nominal_state.q1 * nominal_state.q2), 1.0f - 2.0f * (sqy + sqz));
+
+    return euler;
 }

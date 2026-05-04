@@ -5,7 +5,7 @@
 include $(TOPDIR)/Make.defs
 
 # Baseline Boot & Bringup
-CSRCS = stm32_boot.c stm32_bringup.c pasil_ekf.c
+CSRCS = stm32_boot.c stm32_bringup.c pasil_ekf.c pasil_imu.c
 
 # Link the headers
 CFLAGS += -I$(TOPDIR)/../nuttx-apps/mlearning/cmsis/CMSIS_5/CMSIS/DSP/Include
