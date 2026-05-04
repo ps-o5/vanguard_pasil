@@ -16,6 +16,7 @@ The system evolved from a bare-metal scheduler into a fully distributed architec
 ## 🧩 System Architecture
 
 ![Architecture Diagram](docs/img/0001.png)
+![Architecture Diagram](docs/img/0002.png)
 
 **Core Components:**
 
@@ -78,7 +79,7 @@ The system evolved from a bare-metal scheduler into a fully distributed architec
 
 ## 📊 Performance Validation
 
-![Control Loop Jitter](docs/img/0002.png)
+![Control Loop Jitter](docs/img/0003.png)
 
 - **Control Loop Jitter:** < 10 µs variance  
 - **EKF Stability:** Maintains converged quaternion under high-RPM vibration  
