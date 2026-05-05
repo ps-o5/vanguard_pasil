@@ -145,21 +145,24 @@ CONFIG_LIBC_FLOATINGPOINT=y
 Disable kernel I2C drivers (except required IMU drivers)
 
 Build:
-
+```bash
 make distclean
 ./tools/configure.sh <YOUR_BOARD_CONFIG>
 make -j4
+```
 
 
 ### ⚡ 3. Flashing (STM32F411)
 
 Using st-flash:
-
+```bash
 st-flash write nuttx.bin 0x8000000
+```
 
 Or via OpenOCD / STM32CubeProgrammer as preferred.
 
 ## 🚀 Quick Start
+```bash
 git clone https://github.com/<your-repo>/vanguard-pasil.git
 cd vanguard-pasil
 
@@ -168,7 +171,7 @@ make distclean
 make -j4
 
 st-flash write nuttx.bin 0x8000000
-
+```
 
 ## 📁 Project Structure
 /apps            → Application-level control logic
