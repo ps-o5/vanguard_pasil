@@ -174,10 +174,140 @@ st-flash write nuttx.bin 0x8000000
 ```
 
 ## 📁 Project Structure
-/apps            → Application-level control logic
-/drivers         → Custom sensor interfaces
-/platform        → Board-specific configuration
-/docs/images     → Diagrams and performance plots
+
+custom_boards/
+└── blackpill-f411
+    ├── CMakeLists.txt
+    ├── configs
+    │   ├── mcp2515-extid
+    │   │   └── defconfig
+    │   └── nsh
+    │       └── defconfig
+    ├── include
+    │   └── board.h
+    ├── Kconfig
+    ├── scripts
+    │   ├── flash.ld
+    │   └── Make.defs
+    └── src
+        ├── arm_mat_add_f32.o
+        ├── arm_mat_init_f32.o
+        ├── arm_mat_mult_f32.o
+        ├── arm_mat_trans_f32.o
+        ├── blackpill-f411.h
+        ├── CMakeLists.txt
+        ├── libboard.a
+        ├── Make.defs
+        ├── Make.dep
+        ├── Makefile
+        ├── pasil_ekf.c
+        ├── pasil_ekf.h
+        ├── pasil_ekf.o
+        ├── pasil_imu.c
+        ├── pasil_imu.o
+        ├── stm32_adc.c
+        ├── stm32_ajoystick.c
+        ├── stm32_appinit.c
+        ├── stm32_appinit.o
+        ├── stm32_autoleds.c
+        ├── stm32_boot.c
+        ├── stm32_boot.o
+        ├── stm32_bringup.c
+        ├── stm32_bringup.o
+        ├── stm32_buttons.c
+        ├── stm32_lcd_ssd1306.c
+        ├── stm32_mcp2515.c
+        ├── stm32_spi.c
+        ├── stm32_spi.o
+        ├── stm32_userleds.c
+        ├── stm32_userleds.o
+        ├── vl53l0x_api
+        │   ├── vl53l0x_api.c
+        │   ├── vl53l0x_api_calibration.c
+        │   ├── vl53l0x_api_calibration.h
+        │   ├── vl53l0x_api_core.c
+        │   ├── vl53l0x_api_core.h
+        │   ├── vl53l0x_api.h
+        │   ├── vl53l0x_api_ranging.c
+        │   ├── vl53l0x_api_ranging.h
+        │   ├── vl53l0x_api_strings.c
+        │   ├── vl53l0x_api_strings.h
+        │   ├── vl53l0x_def.h
+        │   ├── vl53l0x_device.h
+        │   ├── vl53l0x_i2c_platform.h
+        │   ├── vl53l0x_interrupt_threshold_settings.h
+        │   ├── vl53l0x_platform.c
+        │   ├── vl53l0x_platform.h
+        │   ├── vl53l0x_platform_log.h
+        │   ├── vl53l0x_tuning.h
+        │   └── vl53l0x_types.h
+        ├── vl53l0x_api_calibration.o
+        ├── vl53l0x_api_core.o
+        ├── vl53l0x_api.o
+        ├── vl53l0x_api_strings.o
+        └── vl53l0x_platform.o
+docs/
+├── digital.csv
+├── img
+│   ├── 0001.png
+│   ├── 0002.png
+│   ├── 0003.png
+│   ├── 0004.png
+│   ├── 0005.png
+│   ├── 0006.png
+│   └── 0007.png
+└── VANGUARD-PASIL-Pratik_Suryawanshi.pdf
+Ground-Control-Station/
+├── GCS
+│   ├── GCS.ino
+│   └── payload.h
+└── README.md
+KiCAD_Files/
+└── VANGUARD-PASIL
+    ├── GCS.kicad_sch
+    ├── VANGAURD-PASIL_Symbols.bak
+    ├── VANGAURD-PASIL_Symbols.kicad_sym
+    ├── VANGUARD-PASIL-backups
+    │   ├── VANGUARD-PASIL-2026-04-28_141102.zip
+    │   ├── VANGUARD-PASIL-2026-04-28_175334.zip
+    │   ├── VANGUARD-PASIL-2026-04-28_181030.zip
+    │   ├── VANGUARD-PASIL-2026-04-28_195817.zip
+    │   ├── VANGUARD-PASIL-2026-04-28_195952.zip
+    │   ├── VANGUARD-PASIL-2026-04-28_200031.zip
+    │   ├── VANGUARD-PASIL-2026-04-28_200310.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_194642.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_200738.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_210452.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_210541.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_214114.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_214334.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_214513.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_214648.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_214719.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_214737.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_224135.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_225311.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_225843.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_234853.zip
+    │   ├── VANGUARD-PASIL-2026-04-29_235208.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_000211.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_000333.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_001110.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_001237.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_001340.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_001416.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_001615.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_001829.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_002008.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_095227.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_110327.zip
+    │   ├── VANGUARD-PASIL-2026-04-30_132318.zip
+    │   └── VANGUARD-PASIL-2026-04-30_133915.zip
+    ├── VANGUARD-PASIL.kicad_pcb
+    ├── VANGUARD-PASIL.kicad_prl
+    ├── VANGUARD-PASIL.kicad_pro
+    └── VANGUARD-PASIL.kicad_sch
+
 
 ## 🧪 Validation Environment
 High-RPM motor vibration testing
