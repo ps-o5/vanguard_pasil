@@ -147,7 +147,7 @@ Disable kernel I2C drivers (except required IMU drivers)
 Build:
 ```bash
 make distclean
-./tools/configure.sh <YOUR_BOARD_CONFIG>
+./tools/configure.sh -l ../custom_boards/blackpill-f411/configs/nsh
 make -j4
 ```
 
@@ -164,10 +164,10 @@ Or via OpenOCD / STM32CubeProgrammer as preferred.
 ## 🚀 Quick Start
 ```bash
 git clone https://github.com/<your-repo>/vanguard-pasil.git
-cd vanguard-pasil
+cd vanguard-pasil/nuttx/
 
 make distclean
-./tools/configure.sh <YOUR_BOARD_CONFIG>
+./tools/configure.sh ../custom_boards/blackpill-f411/configs
 make -j4
 
 st-flash write nuttx.bin 0x8000000
