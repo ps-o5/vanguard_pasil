@@ -174,7 +174,7 @@ st-flash write nuttx.bin 0x8000000
 ```
 
 ## 📁 Project Structure
-
+```bash
 custom_boards/
 └── blackpill-f411
     ├── CMakeLists.txt
@@ -307,6 +307,7 @@ KiCAD_Files/
     ├── VANGUARD-PASIL.kicad_prl
     ├── VANGUARD-PASIL.kicad_pro
     └── VANGUARD-PASIL.kicad_sch
+```
 
 
 ## 🧪 Validation Environment
