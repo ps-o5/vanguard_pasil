@@ -167,7 +167,7 @@ git clone https://github.com/<your-repo>/vanguard-pasil.git
 cd vanguard-pasil/nuttx/
 
 make distclean
-./tools/configure.sh ../custom_boards/blackpill-f411/configs
+./tools/configure.sh -l ../custom_boards/blackpill-f411/configs
 make -j4
 
 st-flash write nuttx.bin 0x8000000
