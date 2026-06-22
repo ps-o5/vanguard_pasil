@@ -114,25 +114,57 @@ void eskf_init(void) {
     for (int i = 3; i < 6; i++) Q_data[i * 7] = Q_BIAS_VAR;  
 }
 
+/* --- Helper: Quaternion Derivative for RK4 --- */
+static inline void quat_derivative(float q0, float q1, float q2, float q3, 
+                                   float wx, float wy, float wz, float* dq) {
+    dq[0] = 0.5f * (-q1 * wx - q2 * wy - q3 * wz);
+    dq[1] = 0.5f * ( q0 * wx - q3 * wy + q2 * wz);
+    dq[2] = 0.5f * ( q3 * wx + q0 * wy - q1 * wz);
+    dq[3] = 0.5f * (-q2 * wx + q1 * wy + q0 * wz);
+}
+
+
 void eskf_predict(float gyro_x, float gyro_y, float gyro_z, float dt) {
     /* 1. Correct raw gyro with estimated bias */
     float wx = gyro_x - nominal_state.bg_x;
     float wy = gyro_y - nominal_state.bg_y;
     float wz = gyro_z - nominal_state.bg_z;
 
-    /* 2. Nominal State Kinematic Integration (Zeroth-order hold) */
-    float dq0 = 1.0f;
-    float dq1 = 0.5f * wx * dt;
-    float dq2 = 0.5f * wy * dt;
-    float dq3 = 0.5f * wz * dt;
+    /* 2. Nominal State Kinematic Integration (4th-Order Runge-Kutta) */
+    float q0 = nominal_state.q0;
+    float q1 = nominal_state.q1;
+    float q2 = nominal_state.q2;
+    float q3 = nominal_state.q3;
+    float k1[4], k2[4], k3[4], k4[4];
 
-    float q0_new = nominal_state.q0*dq0 - nominal_state.q1*dq1 - nominal_state.q2*dq2 - nominal_state.q3*dq3;
-    float q1_new = nominal_state.q0*dq1 + nominal_state.q1*dq0 + nominal_state.q2*dq3 - nominal_state.q3*dq2;
-    float q2_new = nominal_state.q0*dq2 - nominal_state.q1*dq3 + nominal_state.q2*dq0 + nominal_state.q3*dq1;
-    float q3_new = nominal_state.q0*dq3 + nominal_state.q1*dq2 - nominal_state.q2*dq1 + nominal_state.q3*dq0;
-    
-    nominal_state.q0 = q0_new; nominal_state.q1 = q1_new; 
-    nominal_state.q2 = q2_new; nominal_state.q3 = q3_new;
+    /* k1 = f(q, w) */
+    quat_derivative(q0, q1, q2, q3, wx, wy, wz, k1);
+
+    /* k2 = f(q + 0.5*dt*k1, w) */
+    quat_derivative(q0 + 0.5f * dt * k1[0], 
+                    q1 + 0.5f * dt * k1[1], 
+                    q2 + 0.5f * dt * k1[2], 
+                    q3 + 0.5f * dt * k1[3], wx, wy, wz, k2);
+
+    /* k3 = f(q + 0.5*dt*k2, w) */
+    quat_derivative(q0 + 0.5f * dt * k2[0], 
+                    q1 + 0.5f * dt * k2[1], 
+                    q2 + 0.5f * dt * k2[2], 
+                    q3 + 0.5f * dt * k2[3], wx, wy, wz, k3);
+
+    /* k4 = f(q + dt*k3, w) */
+    quat_derivative(q0 + dt * k3[0], 
+                    q1 + dt * k3[1], 
+                    q2 + dt * k3[2], 
+                    q3 + dt * k3[3], wx, wy, wz, k4);
+
+    /* Combine and integrate */
+    float dt_over_6 = dt / 6.0f;
+    nominal_state.q0 += dt_over_6 * (k1[0] + 2.0f * k2[0] + 2.0f * k3[0] + k4[0]);
+    nominal_state.q1 += dt_over_6 * (k1[1] + 2.0f * k2[1] + 2.0f * k3[1] + k4[1]);
+    nominal_state.q2 += dt_over_6 * (k1[2] + 2.0f * k2[2] + 2.0f * k3[2] + k4[2]);
+    nominal_state.q3 += dt_over_6 * (k1[3] + 2.0f * k2[3] + 2.0f * k3[3] + k4[3]);
+
     normalize_quaternion();
 
     /* 3. Error State Covariance Predict: P = F * P * F^T + Q */
